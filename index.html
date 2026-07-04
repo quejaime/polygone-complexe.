@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Saisie de Polygone Complexe</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Styles spécifiques pour le canevas et les indicateurs */
+        #canvas-container {
+            position: relative;
+            width: 500px;
+            height: 500px;
+            margin: 0 auto;
+            border-radius: 50%;
+            background-color: #f8fafc;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+            overflow: hidden; /* Pour s'assurer que le dessin reste dans le cercle */
+            border: 2px solid #e2e8f0;
+        }
+        canvas {
+            display: block;
+        }
+        
+        /* La croix centrale représentant l'origine (z=0) */
+        .origin-cross {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            transform: translate(-50%, -50%);
+            pointer-events: none; /* Ne bloque pas les clics souris */
+        }
+        .origin-cross::before, .origin-cross::after {
+            content: '';
+            position: absolute;
+            background-color: #94a3b8;
+        }
+        .origin-cross::before {
+            top: 50%; left: 0; right: 0; height: 2px; transform: translateY(-50%);
+        }
+        .origin-cross::after {
+            left: 50%; top: 0; bottom: 0; width: 2px; transform: translateX(-50%);
+        }
+
+        /* Styles pour le voyant d'état */
+        .status-light {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            transition: all 0.3s ease;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1) inset;
+        }
+        .status-light.green {
+            background-color: #22c55e;
+            box-shadow: 0 0 15px #22c55e;
+        }
+        .status-light.red {
+            background-color: #ef4444;
+            box-shadow: 0 0 15px #ef4444;
+        }
+        .status-light.off {
+            background-color: #cbd5e1;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen font-sans text-gray-800 flex flex-col items-center py-8">
+
+    <div class="max-w-3xl w-full px-4">
+        <h1 class="text-3xl font-bold text-center mb-2 text-slate-800">Définition de Courbe de Jordan</h1>
+        <p class="text-center text-slate-500 mb-8">Cliquez dans le disque pour définir les sommets du polygone (z=0 au centre). Au moins 3 points. Cliquez sur le premier point pour fermer.</p>
+
+        <!-- Panneau de contrôle et statut -->
+        <div class="flex items-center justify-between mb-6 bg-white p-4 rounded-xl shadow-sm border border-slate-200">
+            <div class="flex items-center space-x-4">
+                <div id="statusIndicator" class="status-light green"></div>
+                <div>
+                    <h2 class="font-semibold text-slate-700">Statut de la saisie</h2>
+                    <p id="statusMessage" class="text-sm text-slate-500">En attente de points...</p>
+                </div>
+            </div>
+            <button id="resetBtn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors font-medium">
+                Recommencer
+            </button>
+        </div>
+
+        <!-- Conteneur principal du Canevas -->
+        <div id="canvas-container" class="cursor-crosshair">
+            <canvas id="complexCanvas" width="500" height="500"></canvas>
+            <div class="origin-cross"></div>
+        </div>
+
+        <!-- Affichage des données (pour le debug/export) -->
+        <div class="mt-8 bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+            <h3 class="font-semibold text-slate-700 mb-3 flex items-center justify-between">
+                <span>Coordonnées Algébriques (Z)</span>
+                <span id="pointCount" class="text-sm bg-slate-100 px-2 py-1 rounded text-slate-500">0 point(s)</span>
+            </h3>
+            <div class="bg-slate-50 p-4 rounded-lg font-mono text-sm text-slate-600 h-48 overflow-y-auto border border-slate-200">
+                <ul id="coordinatesList" class="space-y-1">
+                    <li class="italic text-slate-400">Aucun point saisi pour le moment.</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- CONSTANTES ET CONFIGURATION ---
+        const canvas = document.getElementById('complexCanvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('canvas-container');
+        
+        const RADIUS = canvas.width / 2; // Le rayon du disque en pixels (250)
+        const CENTER = { x: RADIUS, y: RADIUS }; // L'origine (0,0) en pixels
+        const CLOSE_THRESHOLD = 0.05; // Distance complexe pour fermer le polygone
+
+        // Éléments UI
+        const statusIndicator = document.getElementById('statusIndicator');
+        const statusMessage = document.getElementById('statusMessage');
+        const coordinatesList = document.getElementById('coordinatesList');
+        const pointCountDisplay = document.getElementById('pointCount');
+        const resetBtn = document.getElementById('resetBtn');
+
+        // --- ETAT DE L'APPLICATION ---
+        let points = []; // Stocke les points en coordonnées complexes {x, y}
+        let isClosed = false; // Indique si le polygone est terminé
+
+        // --- FONCTIONS MATHÉMATIQUES ---
+
+        // Convertit les pixels du canevas en coordonnées complexes dans le disque unité
+        // Pixels (0,0) en haut à gauche -> Complexe (0,0) au centre, rayon 1
+        function pxToComplex(px, py) {
+            return {
+                x: (px - CENTER.x) / RADIUS,
+                y: -(py - CENTER.y) / RADIUS // Axe Y inversé entre canvas et plan mathématique
+            };
+        }
+
+        // Convertit les coordonnées complexes en pixels pour le dessin
+        function complexToPx(cx, cy) {
+            return {
+                x: CENTER.x + cx * RADIUS,
+                y: CENTER.y - cy * RADIUS
+            };
+        }
+
+        // Distance euclidienne au carré entre deux points complexes
+        function distSq(p1, p2) {
+            return (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2;
+        }
+
+        // Test d'orientation pour l'intersection (Sens trigonométrique)
+        function ccw(A, B, C) {
+            return (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x);
+        }
+
+        // Vérifie si le segment [A,B] intersecte le segment [C,D]
+        function intersect(A, B, C, D) {
+            return ccw(A, C, D) !== ccw(B, C, D) && ccw(A, B, C) !== ccw(A, B, D);
+        }
+
+        // Vérifie si l'ajout du point pt créerait une auto-intersection
+        function createsSelfIntersection(pt) {
+            const n = points.length;
+            if (n < 3) return false; // Impossible de s'auto-intersecter avec moins de 3 segments
+
+            const newSegStart = points[n - 1];
+            const newSegEnd = pt;
+
+            // On vérifie tous les segments existants SAUF le dernier (qui touche forcément le nouveau)
+            // et si on est en train de fermer (pt == points[0]), on ne vérifie pas le premier segment
+            const isClosing = (pt.x === points[0].x && pt.y === points[0].y);
+            const limit = isClosing ? n - 2 : n - 2;
+
+            for (let i = 0; i < limit; i++) {
+                const segStart = points[i];
+                const segEnd = points[i + 1];
+                if (intersect(newSegStart, newSegEnd, segStart, segEnd)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Calcule le Winding Number (Indice) par rapport à l'origine (0,0)
+        function checkOriginInside() {
+            let angleSum = 0;
+            const n = points.length;
+            
+            for (let i = 0; i < n - 1; i++) {
+                const p1 = points[i];
+                const p2 = points[i + 1];
+                
+                // Formule de l'angle orienté basée sur le produit scalaire et vectoriel
+                const dot = p1.x * p2.x + p1.y * p2.y;
+                const det = p1.x * p2.y - p1.y * p2.x;
+                const dTheta = Math.atan2(det, dot);
+                
+                angleSum += dTheta;
+            }
+
+            // Si la somme est proche de 2*PI ou -2*PI, on a fait un tour autour de l'origine
+            const isInside = Math.abs(Math.abs(angleSum) - 2 * Math.PI) < 0.1;
+            return isInside;
+        }
+
+        // --- FONCTIONS DE DESSIN ---
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Dessiner les segments validés
+            if (points.length > 0) {
+                ctx.beginPath();
+                const startPx = complexToPx(points[0].x, points[0].y);
+                ctx.moveTo(startPx.x, startPx.y);
+
+                for (let i = 1; i < points.length; i++) {
+                    const px = complexToPx(points[i].x, points[i].y);
+                    ctx.lineTo(px.x, px.y);
+                }
+
+                ctx.strokeStyle = '#3b82f6'; // Bleu
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // Dessiner les sommets
+                points.forEach((pt, index) => {
+                    const px = complexToPx(pt.x, pt.y);
+                    ctx.beginPath();
+                    ctx.arc(px.x, px.y, 4, 0, 2 * Math.PI);
+                    ctx.fillStyle = index === 0 ? '#ef4444' : '#3b82f6'; // Premier point en rouge, autres en bleu
+                    ctx.fill();
+                });
+            }
+        }
+
+        // --- GESTION DE L'INTERFACE (UI) ---
+        function updateUI() {
+            // Mise à jour de la liste textuelle
+            if (points.length === 0) {
+                coordinatesList.innerHTML = '<li class="italic text-slate-400">Aucun point saisi pour le moment.</li>';
+                pointCountDisplay.textContent = '0 point(s)';
+            } else {
+                coordinatesList.innerHTML = '';
+                points.forEach((pt, index) => {
+                    const li = document.createElement('li');
+                    // Formatage algébrique propre : x + i*y
+                    const sign = pt.y >= 0 ? '+' : '-';
+                    const formatted = `z_${index} = ${pt.x.toFixed(4)} ${sign} i*${Math.abs(pt.y).toFixed(4)}`;
+                    li.textContent = formatted;
+                    coordinatesList.appendChild(li);
+                });
+                pointCountDisplay.textContent = `${points.length} point(s) ${isClosed ? '(Fermé)' : ''}`;
+            }
+        }
+
+        function setStatus(state, message) {
+            statusIndicator.className = 'status-light'; // reset
+            statusIndicator.classList.add(state);
+            statusMessage.textContent = message;
+            
+            if (state === 'red') {
+                statusMessage.classList.remove('text-slate-500');
+                statusMessage.classList.add('text-red-500', 'font-medium');
+            } else {
+                statusMessage.classList.remove('text-red-500', 'font-medium');
+                statusMessage.classList.add('text-slate-500');
+            }
+        }
+
+        function resetApp() {
+            points = [];
+            isClosed = false;
+            container.classList.remove('cursor-not-allowed');
+            container.classList.add('cursor-crosshair');
+            setStatus('green', 'En attente de points...');
+            draw();
+            updateUI();
+        }
+
+        // --- GESTION DES ÉVÉNEMENTS ---
+
+        canvas.addEventListener('click', (e) => {
+            if (isClosed) return; // Ignore les clics si le polygone est fermé
+
+            // Récupération des coordonnées pixels relatives au canevas
+            const rect = canvas.getBoundingClientRect();
+            const px = e.clientX - rect.left;
+            const py = e.clientY - rect.top;
+
+            // Conversion en complexe
+            const complexPt = pxToComplex(px, py);
+
+            // Contrainte 1: Le clic (grâce au CSS overflow:hidden du conteneur circulaire) 
+            // est mécaniquement dans le disque, mais on double-vérifie mathématiquement
+            if (Math.sqrt(complexPt.x**2 + complexPt.y**2) > 1) {
+                flashRed("Point hors du disque unité.");
+                return;
+            }
+
+            // GESTION DE LA CLÔTURE
+            if (points.length >= 3) {
+                const distToStartSq = distSq(complexPt, points[0]);
+                if (distToStartSq < CLOSE_THRESHOLD ** 2) {
+                    // Tentative de fermeture
+                    // On teste l'intersection en fermant avec le vrai z_0
+                    if (createsSelfIntersection(points[0])) {
+                        flashRed("La fermeture crée une auto-intersection.");
+                        return;
+                    }
+
+                    // On ferme
+                    points.push({...points[0]}); // On duplique z_0 pour z_p
+                    isClosed = true;
+                    draw();
+                    updateUI();
+
+                    // VALIDATION FINALE : Winding Number
+                    if (checkOriginInside()) {
+                        setStatus('green', 'Polygone valide. Origine incluse.');
+                        container.classList.remove('cursor-crosshair');
+                        container.classList.add('cursor-not-allowed');
+                    } else {
+                        setStatus('red', "L'origine n'est pas à l'intérieur ! Réinitialisation...");
+                        // Reset automatique après 2.5 secondes
+                        setTimeout(resetApp, 2500);
+                    }
+                    return;
+                }
+            }
+
+            // GESTION D'UN NOUVEAU POINT
+            if (createsSelfIntersection(complexPt)) {
+                flashRed("Intersection détectée (Courbe de Jordan non respectée).");
+                return;
+            }
+
+            // Le point est valide
+            points.push(complexPt);
+            draw();
+            updateUI();
+            setStatus('green', `Point ${points.length - 1} enregistré.`);
+        });
+
+        // Feedback visuel rapide en cas d'erreur de tracé
+        function flashRed(msg) {
+            setStatus('red', msg);
+            setTimeout(() => {
+                if (!isClosed) setStatus('green', 'Reprise de la saisie...');
+            }, 800);
+        }
+
+        // Bouton reset manuel
+        resetBtn.addEventListener('click', resetApp);
+
+        // Initialisation
+        resetApp();
+
+    </script>
+</body>
+</html>
