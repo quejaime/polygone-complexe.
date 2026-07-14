@@ -80,9 +80,14 @@
                     <p id="statusMessage" class="text-sm text-slate-500">En attente de points...</p>
                 </div>
             </div>
-            <button id="resetBtn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors font-medium">
-                Recommencer
-            </button>
+            <div class="flex items-center space-x-3">
+                <button id="exportBtn" disabled class="px-4 py-2 bg-blue-100 text-blue-300 rounded-lg transition-colors font-medium cursor-not-allowed">
+                    Exporter Z.json
+                </button>
+                <button id="resetBtn" class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg transition-colors font-medium">
+                    Recommencer
+                </button>
+            </div>
         </div>
 
         <!-- Conteneur principal du Canevas -->
@@ -114,17 +119,20 @@
         const RADIUS = canvas.width / 2; // Le rayon du disque en pixels (250)
         const CENTER = { x: RADIUS, y: RADIUS }; // L'origine (0,0) en pixels
         const CLOSE_THRESHOLD = 0.05; // Distance complexe pour fermer le polygone
+        const GEOMETRY_EPS = 1.0e-10; // Tolérance pour les tests géométriques
 
         // Éléments UI
         const statusIndicator = document.getElementById('statusIndicator');
         const statusMessage = document.getElementById('statusMessage');
         const coordinatesList = document.getElementById('coordinatesList');
         const pointCountDisplay = document.getElementById('pointCount');
+        const exportBtn = document.getElementById('exportBtn');
         const resetBtn = document.getElementById('resetBtn');
 
         // --- ETAT DE L'APPLICATION ---
         let points = []; // Stocke les points en coordonnées complexes {x, y}
         let isClosed = false; // Indique si le polygone est terminé
+        let isExportReady = false; // Devient vrai seulement si le polygone ferme est valide
 
         // --- FONCTIONS MATHÉMATIQUES ---
 
@@ -150,14 +158,48 @@
             return (p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2;
         }
 
-        // Test d'orientation pour l'intersection (Sens trigonométrique)
-        function ccw(A, B, C) {
-            return (C.y - A.y) * (B.x - A.x) > (B.y - A.y) * (C.x - A.x);
+        // Produit vectoriel oriente de AB et AC.
+        function orientation(A, B, C) {
+            return (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
         }
 
-        // Vérifie si le segment [A,B] intersecte le segment [C,D]
+        function samePoint(A, B) {
+            return distSq(A, B) <= GEOMETRY_EPS ** 2;
+        }
+
+        function pointOnSegment(P, A, B) {
+            if (Math.abs(orientation(A, B, P)) > GEOMETRY_EPS) return false;
+            return (
+                Math.min(A.x, B.x) - GEOMETRY_EPS <= P.x &&
+                P.x <= Math.max(A.x, B.x) + GEOMETRY_EPS &&
+                Math.min(A.y, B.y) - GEOMETRY_EPS <= P.y &&
+                P.y <= Math.max(A.y, B.y) + GEOMETRY_EPS
+            );
+        }
+
+        // Vérifie si le segment [A,B] intersecte le segment [C,D].
         function intersect(A, B, C, D) {
-            return ccw(A, C, D) !== ccw(B, C, D) && ccw(A, B, C) !== ccw(A, B, D);
+            const o1 = orientation(A, B, C);
+            const o2 = orientation(A, B, D);
+            const o3 = orientation(C, D, A);
+            const o4 = orientation(C, D, B);
+
+            if (Math.abs(o1) <= GEOMETRY_EPS && pointOnSegment(C, A, B)) return true;
+            if (Math.abs(o2) <= GEOMETRY_EPS && pointOnSegment(D, A, B)) return true;
+            if (Math.abs(o3) <= GEOMETRY_EPS && pointOnSegment(A, C, D)) return true;
+            if (Math.abs(o4) <= GEOMETRY_EPS && pointOnSegment(B, C, D)) return true;
+
+            return (o1 > 0) !== (o2 > 0) && (o3 > 0) !== (o4 > 0);
+        }
+
+        function isOnlyAllowedClosureContact(A, B, C, D) {
+            // Pendant la fermeture, [A,B] = [dernier point, premier point]
+            // et [C,D] = [premier point, deuxieme point]. Le contact B=C est
+            // autorise, mais pas un chevauchement ni une intersection plus loin.
+            if (!samePoint(B, C)) return false;
+            if (pointOnSegment(D, A, B)) return false;
+            if (pointOnSegment(A, C, D)) return false;
+            return true;
         }
 
         // Vérifie si l'ajout du point pt créerait une auto-intersection
@@ -168,15 +210,23 @@
             const newSegStart = points[n - 1];
             const newSegEnd = pt;
 
-            // On vérifie tous les segments existants SAUF le dernier (qui touche forcément le nouveau)
-            // et si on est en train de fermer (pt == points[0]), on ne vérifie pas le premier segment
-            const isClosing = (pt.x === points[0].x && pt.y === points[0].y);
-            const limit = isClosing ? n - 2 : n - 2;
+            // Le nouveau segment touche toujours le dernier segment existant.
+            // En cas de fermeture, il touche aussi le premier segment existant.
+            // Ces contacts aux sommets adjacents sont autorisés et ne sont pas
+            // des auto-intersections.
+            const isClosing = samePoint(pt, points[0]);
 
-            for (let i = 0; i < limit; i++) {
+            for (let i = 0; i < n - 2; i++) {
                 const segStart = points[i];
                 const segEnd = points[i + 1];
                 if (intersect(newSegStart, newSegEnd, segStart, segEnd)) {
+                    if (
+                        isClosing &&
+                        i === 0 &&
+                        isOnlyAllowedClosureContact(newSegStart, newSegEnd, segStart, segEnd)
+                    ) {
+                        continue;
+                    }
                     return true;
                 }
             }
@@ -272,11 +322,61 @@
         function resetApp() {
             points = [];
             isClosed = false;
+            isExportReady = false;
             container.classList.remove('cursor-not-allowed');
             container.classList.add('cursor-crosshair');
+            setExportButtonEnabled(false);
             setStatus('green', 'En attente de points...');
             draw();
             updateUI();
+        }
+
+        function setExportButtonEnabled(enabled) {
+            exportBtn.disabled = !enabled;
+
+            if (enabled) {
+                exportBtn.className = 'px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors font-medium';
+            } else {
+                exportBtn.className = 'px-4 py-2 bg-blue-100 text-blue-300 rounded-lg transition-colors font-medium cursor-not-allowed';
+            }
+        }
+
+        function buildPolygonJsonData() {
+            // Format d'echange minimal entre l'interface HTML et les scripts Python.
+            // Les points sont stockes sous la forme re/im pour eviter toute ambiguite
+            // sur la representation des nombres complexes.
+            return {
+                format: 'FHW_POLYGON_Z',
+                version: 1,
+                closed: isClosed,
+                contains_origin: true,
+                points: points.map((pt) => ({
+                    re: pt.x,
+                    im: pt.y
+                }))
+            };
+        }
+
+        function exportPolygonJson() {
+            if (!isExportReady) {
+                flashRed("Le polygone doit être fermé et valide avant l'export.");
+                return;
+            }
+
+            const data = buildPolygonJsonData();
+            const jsonText = JSON.stringify(data, null, 2);
+            const blob = new Blob([jsonText], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = 'Z.json';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            setStatus('green', 'Fichier Z.json exporté.');
         }
 
         // --- GESTION DES ÉVÉNEMENTS ---
@@ -318,10 +418,14 @@
 
                     // VALIDATION FINALE : Winding Number
                     if (checkOriginInside()) {
+                        isExportReady = true;
+                        setExportButtonEnabled(true);
                         setStatus('green', 'Polygone valide. Origine incluse.');
                         container.classList.remove('cursor-crosshair');
                         container.classList.add('cursor-not-allowed');
                     } else {
+                        isExportReady = false;
+                        setExportButtonEnabled(false);
                         setStatus('red', "L'origine n'est pas à l'intérieur ! Réinitialisation...");
                         // Reset automatique après 2.5 secondes
                         setTimeout(resetApp, 2500);
@@ -352,6 +456,7 @@
         }
 
         // Bouton reset manuel
+        exportBtn.addEventListener('click', exportPolygonJson);
         resetBtn.addEventListener('click', resetApp);
 
         // Initialisation
